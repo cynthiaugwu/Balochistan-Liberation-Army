@@ -1,0 +1,441 @@
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(dplyr)
+library(readxl)
+library(gridExtra)
+library(lubridate)
+library(knitr)
+library(tidyr)
+
+
+# Safe data type conversion
+safe_convert <- function(x, target_class) {
+  tryCatch({
+    if (target_class == "POSIXct") {
+      as.POSIXct(x, format = "%Y-%m-%d %H:%M:%S")
+    } else if (target_class == "Date") {
+      as.Date(x)
+    } else {
+      as(x, target_class)
+    }
+  }, error = function(e) {
+    warning(paste("Could not convert column to", target_class, "- keeping original"))
+    x
+  })
+}
+
+convert_columns_safe <- function(df, column_types) {
+  for (col in names(column_types)) {
+    if (col %in% names(df)) {
+      df[[col]] <- safe_convert(df[[col]], column_types[[col]][1])
+    }
+  }
+  return(df)
+}
+
+
+# Set consistent theme
+theme_set(theme_minimal(base_size = 11) +
+            theme(plot.title = element_text(face = "bold", size = 13),
+                  plot.subtitle = element_text(color = "gray40", size = 10),
+                  panel.grid.minor = element_blank()))
+
+# Define color palettes
+soph_colors <- c("0" = "#C8E6C9", "1" = "#81C784", 
+                 "2" = "#4CAF50", "3" = "#FF9800", "4" = "#F44336")
+
+
+# ============================================================================
+# SECTION 1: LOAD AND PREPARE DATA
+# ============================================================================
+
+# GTD DATA
+data1 <- read_excel("/Users/cynthiaugwu/Downloads/globalterrorismdb_0522dist.xlsx", col_types = "text")
+data2 <- read_excel("/Users/cynthiaugwu/Downloads/gtd_Jan_June.xlsx", col_types = "text")
+
+gtd_data <- bind_rows(data1, data2) %>% 
+  mutate(
+    iyear = as.numeric(iyear),
+    imonth = as.numeric(imonth),
+    iday = as.numeric(iday),
+    nkill = as.numeric(nkill),
+    date = suppressWarnings(as.Date(paste(iyear, imonth, iday, sep = "-"), 
+                                    format = "%Y-%m-%d")),
+    year = iyear,
+    phase = case_when(
+      year <= 2010 ~ "Phase 1 (2005-2010)",
+      year <= 2018 ~ "Phase 2 (2011-2018)",
+      TRUE ~ "Phase 3 (2019-2020)"
+    )
+  ) %>%
+  filter(gname == "Baloch Liberation Army (BLA)") %>%
+  select(eventid, date, year, phase, attacktype1_txt, targtype1_txt, 
+         targsubtype1_txt, city, success, suicide, nkill, summary) %>%
+  rename(fatalities = nkill)
+
+
+# ACLED DATA
+acled_raw <- read_csv("/Users/cynthiaugwu/Downloads/2021-01-01-2025-04-30.csv")
+
+acled_data <- acled_raw %>%
+  mutate(
+    date = as.Date(event_date, format = "%Y-%m-%d"),
+    year = as.numeric(year),
+    phase = "Phase 3 (2021-2025)"
+  ) %>%
+  select(event_id_cnty, date, year, phase, disorder_type, event_type, 
+         sub_event_type, actor1, actor2, location, fatalities, notes)
+
+
+# ============================================================================
+# SECTION 2: CALCULATE SOPHISTICATION SCORES
+# ============================================================================
+
+# Score GTD data
+gtd_scored <- gtd_data %>%
+  mutate(
+    tactical_complexity = case_when(
+      attacktype1_txt %in% c("Assassination", 
+                             "Hostage Taking (Kidnapping)", 
+                             "Hostage Taking (Barricade Incident)", 
+                             "Bombing/Explosion") ~ 2,
+      attacktype1_txt %in% c("Armed Assault", 
+                             "Facility/Infrastructure Attack") ~ 1,
+      TRUE ~ 0
+    ),
+    
+    target_hardness = case_when(
+      targtype1_txt %in% c("Military","Government (Diplomatic)", 
+                           "Government (General)", "Airports & Aircraft") ~ 2,
+      targtype1_txt %in% c("Police", "Business", "Transportation",
+                           "Educational Institution", "Telecommunication",
+                           "Utilities","Violent Political Party") ~ 1,
+      targtype1_txt %in% c("Private Citizens & Property", "Journalists & Media", 
+                           "Unknown", "Religious Figures/Institutions") ~ 0,
+      TRUE ~ 0
+    ),
+    
+    sophistication = tactical_complexity + target_hardness
+  )
+
+# Score ACLED data
+acled_scored <- acled_data %>%
+  mutate(
+    # Tactical Complexity
+    tactical_complexity = case_when(
+      # High complexity (2)
+      sub_event_type %in% c("Remote explosive/landmine/IED",  
+                            "Abduction/forced disappearance",   
+                            "Suicide bomb") ~ 2,  
+      sub_event_type %in% c("Armed clash", "Attack",
+                            "Grenade", "Shelling/artillery/missile attack") ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Target Hardness - using actor2 as primary source
+    target_hardness = case_when(
+      # Hard targets (2)
+      grepl("Military Forces", actor2) ~ 2,
+      grepl("Frontier Corps", actor2) ~ 2,  # FC is military/paramilitary
+      
+      # Medium targets (1)
+      grepl("Police Forces", actor2) & !grepl("Frontier Corps", actor2) ~ 1,
+      
+      # Soft targets (0)
+      grepl("Civilians", actor2) ~ 0,
+      
+      # If actor2 is empty/unclear, check notes
+      actor2 == "" | is.na(actor2) | actor2 == "BLA: Baloch Liberation Army" ~ case_when(
+        grepl("military|army|FC|soldier|troops", notes, ignore.case = TRUE) ~ 2,
+        grepl("police|levies|checkpoint", notes, ignore.case = TRUE) ~ 1,
+        grepl("civilian|worker|laborer|teacher", notes, ignore.case = TRUE) ~ 0,
+        TRUE ~ 1  # Default to 1 for unclear armed clashes
+      ),
+      
+      TRUE ~ 0
+    ),
+    
+    sophistication = tactical_complexity + target_hardness
+  )
+
+# ============================================================================
+# SECTION 3: KEY SUMMARY STATISTICS
+# ============================================================================
+
+# GTD Summary
+gtd_summary <- gtd_scored %>%
+  group_by(year) %>%
+  summarise(
+    n_attacks = n(),
+    max_sophistication = max(sophistication, na.rm = TRUE),
+    mean_sophistication = mean(sophistication, na.rm = TRUE),
+    elite_operations = sum(sophistication >= 3),
+    suicide_attacks = sum(suicide == 1),
+    total_fatalities = sum(fatalities, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ACLED Summary
+acled_summary <- acled_scored %>%
+  group_by(year) %>%
+  summarise(
+    n_attacks = n(),
+    max_sophistication = max(sophistication, na.rm = TRUE),
+    mean_sophistication = mean(sophistication, na.rm = TRUE),
+    elite_operations = sum(sophistication >= 3),
+    total_fatalities = sum(fatalities, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Print basic statistics
+cat("\n=== DATASET OVERVIEW ===\n")
+cat(sprintf("GTD (2005-2020): %d attacks\n", nrow(gtd_scored)))
+cat(sprintf("ACLED (2021-2025): %d attacks\n", nrow(acled_scored)))
+cat(sprintf("\nMax Sophistication - GTD: %d\n", max(gtd_scored$sophistication)))
+cat(sprintf("Max Sophistication - ACLED: %d\n", max(acled_scored$sophistication)))
+
+# Dataset Overview with Phase Breakdown
+cat("\n=== DATASET OVERVIEW BY PHASE ===\n")
+
+# GTD Phase Analysis
+gtd_phase_summary <- gtd_scored %>%
+  group_by(phase) %>%
+  summarise(
+    n_attacks = n(),
+    max_sophistication = max(sophistication, na.rm = TRUE),
+    mean_sophistication = round(mean(sophistication, na.rm = TRUE), 2),
+    elite_ops = sum(sophistication >= 3),
+    pct_elite = round(sum(sophistication >= 3)/n() * 100, 1),
+    total_fatalities = sum(fatalities, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nGTD (2005-2020):\n")
+print(gtd_phase_summary)
+
+# ACLED Phase Analysis (only Phase 3)
+acled_phase_summary <- acled_scored %>%
+  group_by(phase) %>%
+  summarise(
+    n_attacks = n(),
+    max_sophistication = max(sophistication, na.rm = TRUE),
+    mean_sophistication = round(mean(sophistication, na.rm = TRUE), 2),
+    elite_ops = sum(sophistication >= 3),
+    pct_elite = round(sum(sophistication >= 3)/n() * 100, 1),
+    total_fatalities = sum(fatalities, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nACLED (2021-2025):\n")
+print(acled_phase_summary)
+
+# Sophistication Distribution Comparison
+cat("\n=== SOPHISTICATION DISTRIBUTION COMPARISON ===\n")
+
+cat("\nGTD Sophistication Distribution:\n")
+gtd_soph_table <- table(gtd_scored$sophistication)
+gtd_soph_pct <- round(prop.table(gtd_soph_table) * 100, 1)
+print(data.frame(
+  Sophistication = names(gtd_soph_table),
+  Count = as.numeric(gtd_soph_table),
+  Percentage = as.numeric(gtd_soph_pct)
+))
+
+cat("\nACLED Sophistication Distribution:\n")
+acled_soph_table <- table(acled_scored$sophistication)
+acled_soph_pct <- round(prop.table(acled_soph_table) * 100, 1)
+print(data.frame(
+  Sophistication = names(acled_soph_table),
+  Count = as.numeric(acled_soph_table),
+  Percentage = as.numeric(acled_soph_pct)
+))
+
+# Distribution by sophistication level per phase (GTD)
+cat("\n=== GTD SOPHISTICATION BY PHASE ===\n")
+gtd_dist <- gtd_scored %>%
+  count(phase, sophistication) %>%
+  group_by(phase) %>%
+  mutate(percentage = round(n/sum(n) * 100, 1)) %>%
+  select(-n) %>%  
+  pivot_wider(names_from = sophistication, 
+              values_from = percentage, 
+              values_fill = 0,
+              names_prefix = "Soph_")
+
+cat("\nGTD Distribution (% of attacks per sophistication level):\n")
+print(gtd_dist)
+
+# Year-by-year capability ceiling
+cat("\n=== CAPABILITY CEILING EVOLUTION ===\n")
+yearly_max <- gtd_scored %>%
+  group_by(year) %>%
+  summarise(
+    max_soph = max(sophistication), 
+    n_attacks = n(),
+    elite_ops = sum(sophistication >= 3)
+  ) %>%
+  mutate(phase = case_when(
+    year <= 2010 ~ "P1",
+    year <= 2018 ~ "P2",
+    TRUE ~ "P3"
+  ))
+print(yearly_max)
+
+# Phase 3 Comparison
+cat("\n=== PHASE 3: TWO METHODOLOGICAL WINDOWS ===\n")
+
+phase3_gtd <- gtd_scored %>%
+  filter(year >= 2019) %>%
+  summarise(
+    dataset = "GTD",
+    years = "2019-2020",
+    n_attacks = n(),
+    max_soph = max(sophistication),
+    mean_soph = round(mean(sophistication), 2),
+    elite_ops = sum(sophistication >= 3),
+    pct_elite = round(sum(sophistication >= 3)/n() * 100, 1)
+  )
+
+phase3_acled <- acled_scored %>%
+  summarise(
+    dataset = "ACLED",
+    years = "2021-2025",
+    n_attacks = n(),
+    max_soph = max(sophistication),
+    mean_soph = round(mean(sophistication), 2),
+    elite_ops = sum(sophistication >= 3),
+    pct_elite = round(sum(sophistication >= 3)/n() * 100, 1)
+  )
+
+print(bind_rows(phase3_gtd, phase3_acled))
+
+cat("\nOperational Tempo:\n")
+cat("- GTD: 10 attacks/year (selective terrorist operations)\n")
+cat("- ACLED: 172 incidents/year (all violent events)\n")
+
+# Key Metrics Comparison
+cat("\n=== KEY METRICS COMPARISON ===\n")
+comparison <- data.frame(
+  Metric = c("Total Incidents", 
+             "Elite Operations (≥3)", 
+             "Elite %", 
+             "Sophistication=4 Count",
+             "Sophistication=4 %"),
+  GTD_Total = c(
+    nrow(gtd_scored),
+    sum(gtd_scored$sophistication >= 3),
+    round(sum(gtd_scored$sophistication >= 3)/nrow(gtd_scored) * 100, 1),
+    sum(gtd_scored$sophistication == 4),
+    round(sum(gtd_scored$sophistication == 4)/nrow(gtd_scored) * 100, 1)
+  ),
+  ACLED_Total = c(
+    nrow(acled_scored),
+    sum(acled_scored$sophistication >= 3),
+    round(sum(acled_scored$sophistication >= 3)/nrow(acled_scored) * 100, 1),
+    sum(acled_scored$sophistication == 4),
+    round(sum(acled_scored$sophistication == 4)/nrow(acled_scored) * 100, 1)
+  )
+)
+print(comparison)
+
+# Phase-wise Elite Operation Trend
+cat("\n=== OPERATIONAL SELECTIVITY EVOLUTION ===\n")
+cat("GTD Phases:\n")
+for(i in 1:nrow(gtd_phase_summary)) {
+  cat(sprintf("  %s: %.1f%% elite operations (%d/%d)\n",
+              gtd_phase_summary$phase[i],
+              gtd_phase_summary$pct_elite[i],
+              gtd_phase_summary$elite_ops[i],
+              gtd_phase_summary$n_attacks[i]))
+}
+cat("\nACLED Phase 3 (2021-2025): %.1f%% elite operations (%d/%d)\n",
+    phase3_acled$pct_elite,
+    phase3_acled$elite_ops,
+    phase3_acled$n_attacks)
+
+cat("\nInterpretation: GTD shows increasing operational selectivity (22.8% → 47.8% → 65%)\n")
+cat("while ACLED captures broader violence spectrum with 57.5% elite operations\n")
+
+
+# Set theme
+theme_set(theme_minimal(base_size = 11))
+
+# VISUALIZATION 1: Time-Series (Reviewer's specific request)
+create_main_timeseries <- function() {
+  
+  # GTD time series
+  gtd_ts <- gtd_scored %>%
+    group_by(year, sophistication) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    complete(year = 2005:2020, sophistication = 0:4, fill = list(count = 0))
+  
+  p1 <- ggplot(gtd_ts, aes(x = year, y = count, fill = factor(sophistication))) +
+    geom_area(position = "stack", alpha = 0.85) +
+    geom_vline(xintercept = c(2010.5, 2018.5), linetype = "dashed", alpha = 0.4) +
+    annotate("text", x = 2007.5, y = 25, label = "Phase 1", size = 3, alpha = 0.6) +
+    annotate("text", x = 2014.5, y = 25, label = "Phase 2", size = 3, alpha = 0.6) +
+    annotate("text", x = 2019.5, y = 8, label = "Phase 3", size = 3, alpha = 0.6) +
+    scale_fill_manual(values = c("0" = "#E8F5E9", "1" = "#81C784", 
+                                 "2" = "#4CAF50", "3" = "#FF9800", "4" = "#D32F2F"),
+                      name = "Sophistication\nScore") +
+    scale_x_continuous(breaks = seq(2006, 2020, 2)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(title = "GTD Dataset (2005-2020): 213 Attacks",
+         subtitle = "Conservative attribution criteria",
+         x = NULL, y = "Number of Attacks") +
+    theme(legend.position = "right",
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(size = 10))
+  
+  # ACLED time series
+  acled_ts <- acled_scored %>%
+    group_by(year, sophistication) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    complete(year = 2021:2025, sophistication = 0:4, fill = list(count = 0))
+  
+  p2 <- ggplot(acled_ts, aes(x = year, y = count, fill = factor(sophistication))) +
+    geom_area(position = "stack", alpha = 0.85) +
+    scale_fill_manual(values = c("0" = "#E8F5E9", "1" = "#81C784", 
+                                 "2" = "#4CAF50", "3" = "#FF9800", "4" = "#D32F2F"),
+                      name = "Sophistication\nScore") +
+    scale_x_continuous(breaks = 2021:2025) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(title = "ACLED Dataset (2021-2025): 739 Incidents",
+         subtitle = "Broader inclusion criteria",
+         x = "Year", y = "Number of Incidents") +
+    theme(legend.position = "right",
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(size = 10))
+  
+  # Combine
+  combined_plot <- p1 / p2 + 
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title = "Figure 1: BLA Attack Frequency by Sophistication Level",
+      subtitle = "Time-series showing operational sophistication distribution (0-4 scale)",
+      caption = "Note: Datasets use different inclusion criteria and cannot be directly compared",
+      theme = theme(plot.title = element_text(size = 14, face = "bold"),
+                    plot.subtitle = element_text(size = 11),
+                    plot.caption = element_text(size = 9, face = "italic"))
+    )
+  
+  return(combined_plot)
+}
+    
+
+# Generate both visualizations
+fig1 <- create_main_timeseries()
+
+# Display
+print(fig1)
+
+# Save high-quality versions
+ggsave("Figure_1_BLA_TimeSeries_Sophistication.png", fig1, 
+       width = 10, height = 8, dpi = 300, bg = "white")
+  
+
+
